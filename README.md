@@ -1,0 +1,192 @@
+Nordstjernen web browser
+========================
+
+Nordstjernen is a web browser, written from scratch in C.
+Focused on supporting the HTML and CSS standards.  
+Runs on Windows, Mac and Linux, with an Android port in progress (see `android/`).
+Nordstjernen is built in Norway. 
+
+
+**HTML Standards:** Behaviour is measured against the spec text, section by section, not against another browser — 114 spec rows fully implemented, 49 partial, 4 absent as of June 2026. 
+
+**Security:** each tab's engine runs in its own sandboxed process (seccomp + Landlock on Linux) behind an IPC + shared-memory-framebuffer boundary · no JIT.
+
+**Minimalism:** The whole engine is about 102,000 lines of C written by Claude and Codex (108 files in src/, excluding the vendored libraries) — small enough for one person to read and audit end-to-end.
+
+Nordstjernen has no JIT so it is much more secure, and can still be fast enough. It ships no telemetry of any kind.
+
+![Nordstjernen rendering the Muscat and Oman article on Wikipedia](docs/screenshot.png)   
+
+<img src="docs/nordstjernen-now.png" alt="Nordstjernen Now!" width="140">
+
+## Standards compliance
+
+Nordstjernen is measured against the **spec text**, section by section,
+not against any other browser. The section-by-section walk-through of
+the in-scope WHATWG HTML standard (§1–§16) in
+[docs/HTML-compatibility.md](docs/HTML-compatibility.md) currently
+records **114 spec rows fully implemented, 49 partial, and 4 absent**
+(June 2026), besides a handful that are non-goals by design, such as
+in-process media codecs. Highlights:
+
+| Spec area | Status |
+|-----------|:------:|
+| §2 Common infrastructure — WHATWG URL, IDN, origins, encodings | ✅ |
+| §3–§4 Semantics, document structure & tabular content | ✅ |
+| §4.8 Embedded content — images, SVG, `iframe`; audio/video hand off to an external player by design; no MathML layout | 🟡 |
+| §4.10 Forms — controls, validation, `valueAs*` | ✅ |
+| §4.12–§4.13 Scripting, custom elements | ✅ |
+| §6 User interaction — focus, `inert`, `contenteditable`; native-file drag-and-drop pending | 🟡 |
+| §7–§8 Loading pages, web application APIs — `fetch`, `XHR`, timers, observers | ✅ |
+| §9 Communication — `WebSocket`, `EventSource`, `postMessage` | ✅ |
+| §10 Web workers | 🟡 |
+| §12 Web storage — `localStorage` / `sessionStorage` | ✅ |
+| §13 HTML syntax (lexbor parser); §14 XML partial | ✅ |
+| §15 Rendering — CSS cascade, flex, grid, transforms | ✅ |
+
+The full section-by-section walk-through lives in
+[docs/HTML-compatibility.md](docs/HTML-compatibility.md).
+
+## Browser features
+
+- **HTML/CSS** via the lexbor parser — modern cascade, flex, grid,
+  transforms, gradients, `@keyframes`.
+- **JavaScript** on the QuickJS interpreter — DOM, Shadow DOM, observer
+  APIs.
+- **Networking** over HTTP/2 with libcurl — HSTS, CSP, partitioned
+  cookies.
+- **Media** — images, optional inline PDF; audio and video are handed
+  off to an external player; any script the host has fonts for.
+- **WebGL** — opt-in, per-site WebGL 1 / 2 mapped onto OpenGL ES;
+  off by default and gated behind a trust prompt. See
+  [`docs/webgl.md`](docs/webgl.md).
+- **WebAssembly** — the full JS API (`compile`, `instantiate`,
+  `Memory`, `Table`, externref) over a vendored WAMR interpreter;
+  runs wasm-bindgen bundles. See
+  [`docs/webassembly.md`](docs/webassembly.md).
+- **Process-per-tab** — each tab's engine runs in its own sandboxed
+  `nordstjernen-renderer` process; the GTK and Qt apps are thin shells
+  that blit the renderer's shared-memory framebuffer and forward input
+  over an IPC control channel (`src/rproc.c`), so a page can't take down
+  the UI. See [`docs/tab-isolation.md`](docs/tab-isolation.md) and
+  [`docs/Rendering.md`](docs/Rendering.md).
+- **UI** — tabs, bookmarks, find-in-page, save-to-PDF, JS console,
+  settings, headless mode, and a C embedding API.
+
+## Download
+
+Nightly builds, rebuilt from `main` each night. These point at the
+latest build — bleeding edge, expect rough edges.
+
+| Platform | Download |
+|----------|----------|
+| Windows | [`nordstjernen-windows-x86_64.zip`](https://www.nordstjernen.org/nightly/nordstjernen-windows-x86_64.zip)  |
+| macOS | [`nordstjernen-macos.dmg`](https://www.nordstjernen.org/nightly/nordstjernen-macos.dmg) |
+| Debian | [`nordstjernen-debian-amd64.deb`](https://www.nordstjernen.org/nightly/nordstjernen-debian-amd64.deb) |
+| Ubuntu | [`nordstjernen-ubuntu-amd64.deb`](https://www.nordstjernen.org/nightly/nordstjernen-ubuntu-amd64.deb) |
+| openSUSE | [`nordstjernen-opensuse-x86_64.rpm`](https://www.nordstjernen.org/nightly/nordstjernen-opensuse-x86_64.rpm) |
+| Linux (portable) | [`nordstjernen-linux-x86_64.zip`](https://www.nordstjernen.org/nightly/nordstjernen-linux-x86_64.zip) |
+| Alpine (musl) | [`nordstjernen-alpine-x86_64.apk`](https://www.nordstjernen.org/nightly/nordstjernen-alpine-x86_64.apk) (`apk add`) · [`.zip`](https://www.nordstjernen.org/nightly/nordstjernen-alpine-x86_64.zip) (portable) |
+| Java API (JDK 21) | [`nordstjernen-java.jar`](https://www.nordstjernen.org/nightly/nordstjernen-java.jar) · [sources](https://www.nordstjernen.org/nightly/nordstjernen-java-sources.jar) · [javadoc](https://www.nordstjernen.org/nightly/nordstjernen-java-javadoc.jar) · [API docs](https://www.nordstjernen.org/nightly/java/apidocs/) |
+| Source | [`nordstjernen-src.tar.xz`](https://www.nordstjernen.org/nightly/nordstjernen-src.tar.xz) |
+
+[Checksums](https://www.nordstjernen.org/nightly/SHA256SUMS) ·
+[all nightly files](https://www.nordstjernen.org/nightly/)
+
+The Java API embeds the engine on the JVM (requires JDK 21); see
+[`java/README.md`](java/README.md).
+
+## Build
+
+```sh
+sudo apt install build-essential pkg-config meson ninja-build \
+    libgtk-4-dev libepoxy-dev libcurl4-openssl-dev libssl-dev libuchardet-dev librsvg2-dev \
+    libpsl-dev libsqlite3-dev libseccomp-dev libwebp-dev
+meson setup builddir && meson compile -C builddir
+./builddir/src/gtk/nordstjernen
+```
+
+lexbor, QuickJS and Wuffs are vendored in-tree — no submodules, no
+downloads. Windows, Fedora, openSUSE and macOS instructions are in
+[docs/](docs/). Keyboard, mouse and touch controls are documented in
+[docs/Controls.md](docs/Controls.md).
+
+## Dependencies
+
+Nordstjernen is a clean-room engine — no upstream browser code. The
+moving parts:
+
+**Vendored in-tree** (built from the main tree, no submodules):
+
+| Component | Role |
+|-----------|------|
+| [lexbor](https://github.com/lexbor/lexbor) | HTML5 → DOM parser, CSS, and the WHATWG URL module (`ns_url_*`) |
+| [QuickJS](https://github.com/quickjs-ng/quickjs) (quickjs-ng fork) | JavaScript engine — no JIT, browser-side hooks added in-tree |
+| [WAMR](https://github.com/bytecodealliance/wasm-micro-runtime) (subset) | WebAssembly interpreter behind the `WebAssembly` JS API (`src/wasm.c`) |
+| [Wuffs](https://github.com/google/wuffs) v0.4 | Memory-safe image decoding — PNG, GIF, BMP, JPEG, WebP (lossless) |
+
+**Required system libraries:**
+
+| Library | Min version | Role |
+|---------|-------------|------|
+| GTK 4 | **≥ 4.22.1 on Windows** (MSYS2 stock), ≥ 4.14 elsewhere (≥ 4.22 preferred) | UI toolkit, GSK renderer |
+| GLib / GModule | (ships with GTK) | core types, dynamic module loading |
+| libepoxy | — | OpenGL/ES function dispatch for WebGL (`src/webgl.c`) |
+| Pango | (ships with GTK) | text shaping and layout |
+| libcurl | ≥ 7.85 | HTTP/2 networking, HSTS, cookies |
+| uchardet | — | charset detection for `ns_html_decode_body` |
+| libpsl | — | public-suffix list for cookie scoping |
+| SQLite | — | IndexedDB persistent storage |
+| librsvg | ≥ 2.46 | SVG rendering / icons |
+| libwebp | — | WebP decoding (lossy VP8 + lossless VP8L) |
+| libseccomp | — (Linux only) | syscall sandbox; no-op on macOS/Windows |
+
+**Optional** (auto-detected; feature compiled in when present):
+
+| Library | Enables |
+|---------|---------|
+| poppler-glib | inline PDF viewing |
+| libavif | AVIF images |
+| fontconfig / pangoft2 | extra font discovery backends |
+
+**Audio / video.** Nordstjernen ships no media codecs. `<audio>` and
+`<video>` render a poster and a play overlay; clicking it resolves the
+source URL inside the sandboxed renderer process and the UI shell hands
+it to an external player — `mpv`, `VLC`, `celluloid`, `totem`,
+`mplayer` or `ffplay` on Linux, otherwise the desktop's default handler
+for the media type (found via `GAppInfo`, so Flatpak players work too),
+the default app via `open` on macOS, and the registered handler on
+Windows. If none is found, a status-bar hint suggests installing
+[mpv](https://mpv.io). A media player is therefore a *recommended
+runtime dependency*, not a build dependency: the `.deb` and `.rpm`
+packages `Recommend` one (defaulting to `mpv`) so playback works out of
+the box, while source builds need none. The player is launched from the
+UI shell, never from the page's untrusted renderer.
+
+Streaming sites (YouTube and friends) drive `<video>` through MSE/`blob:`
+with no plain file URL. For those, clicking hands the **page URL** to the
+player instead, so `mpv`/`VLC` resolve it with
+[yt-dlp](https://github.com/yt-dlp/yt-dlp) — install yt-dlp alongside the
+player to watch them.
+
+## License
+
+Nordstjernen Source License v1.0 — use, modify and redistribute freely,
+except as a competing browser; each release becomes MIT after ten years.
+See [License.md](License.md). Commercial licenses by agreement.
+
+Nordstjernen Source License is inspired by https://fsl.software/  
+The Functional Source License (FSL) is a Fair Source license that converts to Apache 2.0 or MIT.
+
+Project home: <https://nordstjernen.org> · Copyright 2026 Andreas Røsdal.
+
+## Builds
+[![linux](https://github.com/nordstjernen-web/nordstjernen/actions/workflows/linux.yml/badge.svg?branch=main)](https://github.com/nordstjernen-web/nordstjernen/actions/workflows/linux.yml)
+[![macos](https://github.com/nordstjernen-web/nordstjernen/actions/workflows/macos.yml/badge.svg?branch=main)](https://github.com/nordstjernen-web/nordstjernen/actions/workflows/macos.yml)
+[![windows](https://github.com/nordstjernen-web/nordstjernen/actions/workflows/windows.yml/badge.svg?branch=main)](https://github.com/nordstjernen-web/nordstjernen/actions/workflows/windows.yml)
+[![android](https://github.com/nordstjernen-web/nordstjernen/actions/workflows/android.yml/badge.svg?branch=main)](https://github.com/nordstjernen-web/nordstjernen/actions/workflows/android.yml)
+[![java](https://github.com/nordstjernen-web/nordstjernen/actions/workflows/java.yml/badge.svg?branch=main)](https://github.com/nordstjernen-web/nordstjernen/actions/workflows/java.yml)
+[![codeql](https://github.com/nordstjernen-web/nordstjernen/actions/workflows/codeql.yml/badge.svg)](https://github.com/nordstjernen-web/nordstjernen/actions/workflows/codeql.yml)
+[![Semgrep](https://img.shields.io/badge/semgrep-scan-success?logo=semgrep)](https://semgrep.dev/orgs/nordstjerna/projects/6111979)
+
+<img src="docs/best-viewed-in-nordstjernen.png" alt="Best viewed in Nordstjernen" width="140">
