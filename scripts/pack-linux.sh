@@ -1,0 +1,183 @@
+#!/usr/bin/env bash
+# Build a redistributable Nordstjernen Linux x86_64 release: the stripped,
+# LTO-optimised nordstjernen binary plus the data files it needs at runtime,
+# zipped under dist/.
+set -euo pipefail
+
+log() { printf '[pack-linux] %s\n' "$*" >&2; }
+trap 'rc=$?; printf "[pack-linux] FAILED (exit %s) at line %s: %s\n" \
+    "$rc" "$LINENO" "$BASH_COMMAND" >&2; exit $rc' ERR
+[ -n "${NS_DEBUG:-}" ] && set -x
+
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+BUILDDIR=${BUILDDIR:-$ROOT/release-build}
+VERSION=${VERSION:-$(awk -F"'" \
+    '/^[[:space:]]*version[[:space:]]*:/ { print $2; exit }' "$ROOT/meson.build")}
+ARCH=$(uname -m)
+FSVERSION=${VERSION//\~/-}
+FSVERSION=${FSVERSION//\//-}
+FLAVOR=${NS_PACK_FLAVOR:-}
+if [ "$FLAVOR" = qt ]; then
+    : "${NS_PACK_QT:=enabled}"
+    SLUG="nordstjernen-${FSVERSION}-linux-qt-${ARCH}"
+else
+    SLUG="nordstjernen-${FSVERSION}-linux-${ARCH}"
+fi
+STAGE="$ROOT/dist/${SLUG}"
+ZIP="$ROOT/dist/${SLUG}.zip"
+
+if [ ! -d "$BUILDDIR" ]; then
+    meson setup "$BUILDDIR" --buildtype=release -Db_lto="${NS_BUILD_LTO:-true}" \
+        -Db_ndebug=true --strip -Dqt="${NS_PACK_QT:-auto}" \
+        ${NS_BUILD_DATE:+-Dbuild_date="$NS_BUILD_DATE"}
+fi
+meson compile -C "$BUILDDIR" ${NS_BUILD_JOBS:+-j "$NS_BUILD_JOBS"}
+strip --strip-all "$BUILDDIR/src/gtk/nordstjernen"
+# The GUI is a thin shell that spawns one sandboxed nordstjernen-renderer
+# process per tab; it must ship alongside the main binary.
+strip --strip-all "$BUILDDIR/src/nordstjernen-renderer"
+QT_BIN="$BUILDDIR/src/qt/nordstjernen-qt"
+if [ -f "$QT_BIN" ]; then
+    strip --strip-all "$QT_BIN"
+fi
+if [ "$FLAVOR" = qt ] && [ ! -f "$QT_BIN" ]; then
+    log "ERROR: NS_PACK_FLAVOR=qt but $QT_BIN was not built (Qt 6 missing at configure time?)"
+    exit 1
+fi
+
+LOADER=$(ldd "$BUILDDIR/src/gtk/nordstjernen" 2>/dev/null \
+    | grep -m1 -oE 'ld-(musl|linux)[^ ]*' || true)
+if printf '%s' "$LOADER" | grep -q 'ld-musl'; then
+    LIBC=musl
+else
+    LIBC=glibc
+fi
+[ -n "$LOADER" ] || LOADER="ld-$LIBC"
+
+if [ "$LIBC" = musl ]; then
+    LIBC_REQ='- musl libc (Alpine 3.19+ era and later)'
+    RUNTIME_INSTALL='    sudo apk add gtk4.0 libcurl uchardet librsvg poppler-glib libavif libwebp \
+        libseccomp libpsl sqlite-libs ca-certificates font-dejavu      # Alpine (musl)'
+else
+    # Don't guess the glibc floor — read it from the binary we just built.
+    GLIBC_MIN=$(objdump -T "$BUILDDIR/src/gtk/nordstjernen" 2>/dev/null \
+        | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -t. -k1,1V -k2,2n -u \
+        | tail -1 | cut -d_ -f2)
+    LIBC_REQ="- glibc ${GLIBC_MIN:-2.38}+ (for 2.38: Ubuntu 24.04 / Debian 13 / Fedora 39 era and later)"
+    RUNTIME_INSTALL='    sudo apt   install libgtk-4-1 libcurl4 libuchardet0 librsvg2-2 libwebp7 \
+        libpoppler-glib8 libavif16 libpsl5 libseccomp2 libsqlite3-0    # Debian/Ubuntu
+    sudo dnf   install gtk4 libcurl libuchardet librsvg2 poppler-glib libwebp \
+        libavif libpsl libseccomp sqlite-libs                          # Fedora/RHEL
+    sudo zypper install libgtk-4-1 libcurl4 libuchardet0 librsvg-2-2 libwebp7 \
+        libpoppler-glib8 libavif16 libpsl5 libseccomp2 libsqlite3-0    # openSUSE'
+fi
+
+rm -rf "$STAGE"
+mkdir -p "$STAGE/data/icons/hicolor/scalable/apps"
+cp "$BUILDDIR/src/gtk/nordstjernen" "$STAGE/"
+cp "$BUILDDIR/src/nordstjernen-renderer" "$STAGE/"
+# The experimental Qt 6 frontend, when Qt 6 was available at build time. It is
+# a second thin shell over the same nordstjernen-renderer process.
+if [ -f "$QT_BIN" ]; then
+    cp "$QT_BIN" "$STAGE/"
+fi
+cp "$ROOT"/data/icons/hicolor/scalable/apps/nordstjernen*.svg \
+   "$ROOT"/data/icons/hicolor/scalable/apps/nordstjernen.gif \
+   "$STAGE/data/icons/hicolor/scalable/apps/"
+cp "$ROOT/data/nordstjernen.desktop" "$STAGE/data/"
+cp "$ROOT/README.md" "$STAGE/"
+cp "$ROOT/THIRD-PARTY-LICENSES.md" "$STAGE/"
+cp "$ROOT/License.md" "$STAGE/"
+
+if [ -f "$STAGE/nordstjernen-qt" ]; then
+    QT_REQ_NOTE='
+This build also ships **nordstjernen-qt**, the experimental Qt 6 frontend
+(`docs/qt.md`). It is a second thin shell that drives the same sandboxed
+nordstjernen-renderer process as the GTK app, so on top of the runtime above it
+needs the Qt 6 libraries:
+
+- Qt 6 Core, Gui, Widgets, Concurrent
+
+      sudo apt    install libqt6widgets6 libqt6gui6 libqt6core6     # Debian/Ubuntu
+      sudo dnf    install qt6-qtbase                                # Fedora/RHEL
+      sudo zypper install libQt6Widgets6 libQt6Gui6 libQt6Core6     # openSUSE
+'
+    QT_RUN_NOTE='
+### Qt frontend (experimental)
+
+    ./nordstjernen-qt https://example.com
+'
+else
+    QT_REQ_NOTE=''
+    QT_RUN_NOTE=''
+fi
+
+cat > "$STAGE/INSTALL.md" <<EOF
+# Nordstjernen ${VERSION} — Linux ${ARCH} binary
+
+Stripped, LTO-optimised build. The browser engine itself (lexbor for
+HTML, quickjs for JavaScript, wuffs for image decoding, wamr for
+WebAssembly) is statically linked into the binary. The GTK 4 desktop
+stack stays dynamic because it expects to find pixbuf loaders, IM
+modules and font/theme data on the host at runtime — fully-static GTK
+isn't practical.
+
+## Runtime requirements
+
+This is a ${LIBC} build (linked against ${LOADER}). It will not run
+against the other C library — pick the matching download.
+
+${LIBC_REQ}
+- GTK 4.6+, with gio, gobject, pango, cairo, gdk-pixbuf
+- libepoxy (usually pulled in by GTK 4; WebGL dispatch)
+- libcurl with a TLS backend; OpenSSL 3 (libcrypto)
+- libuchardet
+- librsvg (SVG rendering)
+- libpoppler-glib (PDF rendering)
+- libavif 16 (AVIF images — only in recent distro releases)
+- libwebp (WebP images)
+- libpsl, libseccomp, libsqlite3
+- fontconfig + a font set; harfbuzz; freetype; libstdc++
+- ca-certificates (TLS trust store)
+- An X11 or Wayland session
+
+Distro install commands:
+
+${RUNTIME_INSTALL}
+
+For Linux distros without modern GTK 4, build an AppImage instead
+(future work).
+${QT_REQ_NOTE}
+## Run
+
+    ./nordstjernen https://example.com
+${QT_RUN_NOTE}
+
+## Install on user path
+
+    install -Dm755 nordstjernen ~/.local/bin/nordstjernen
+    install -Dm644 data/icons/hicolor/scalable/apps/nordstjernen.svg \\
+        ~/.local/share/icons/hicolor/scalable/apps/nordstjernen.svg
+
+## License
+
+Source-available; redistribution / commercial use require a license.
+Copyright 2026 Andreas Røsdal. See README.md for details.
+EOF
+
+log "staged: $(cd "$STAGE" && find . -type f | sort | tr '\n' ' ')"
+log "zip -> $ZIP"
+rm -f "$ZIP"
+( cd "$ROOT/dist" && zip -r "$(basename "$ZIP")" "$(basename "$STAGE")" >/dev/null )
+[ -s "$ZIP" ] || { log "ERROR: $ZIP missing or empty after zip"; exit 1; }
+
+zip_size=$(du -h "$ZIP" 2>/dev/null | cut -f1 || echo '?')
+bin_size=$(du -h "$STAGE/nordstjernen" 2>/dev/null | cut -f1 || echo '?')
+echo "Built: $ZIP ($zip_size)"
+echo "Binary size: $bin_size"
+if [ -f "$STAGE/nordstjernen-qt" ]; then
+    qt_size=$(du -h "$STAGE/nordstjernen-qt" 2>/dev/null | cut -f1 || echo '?')
+    echo "Qt frontend:  included (nordstjernen-qt, $qt_size)"
+fi
+echo
+echo "Smoke test: ./dist/${SLUG}/nordstjernen --headless --url=https://example.com --dump=text"

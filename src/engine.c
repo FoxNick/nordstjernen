@@ -1,0 +1,599 @@
+/* Nordstjernen — synchronous fetch/cascade/layout/capture pipeline.
+ * Copyright 2026 Andreas Røsdal
+ * SPDX-License-Identifier: LicenseRef-NSL-1.0
+ */
+
+#include "engine.h"
+
+#include <cairo-pdf.h>
+#include <cairo.h>
+#include <stdio.h>
+#include <string.h>
+
+#include "css.h"
+#include "debuglog.h"
+#include "image.h"
+#include "paint.h"
+#include "render.h"
+
+typedef struct fetch_state {
+    GMainLoop  *loop;
+    ns_response *resp;
+    GError      *error;
+} fetch_state;
+
+static int g_engine_blocking_depth;
+
+gboolean
+ns_engine_in_blocking_fetch(void)
+{
+    return g_engine_blocking_depth > 0;
+}
+
+static void
+on_fetch_done(GObject *src, GAsyncResult *result, gpointer user_data)
+{
+    (void)src;
+    fetch_state *st = user_data;
+    st->resp = ns_net_fetch_finish(result, &st->error);
+    g_main_loop_quit(st->loop);
+}
+
+ns_response *
+ns_engine_fetch_blocking(const char *url, const char *top_url, GError **error)
+{
+    fetch_state st = {0};
+    st.loop = g_main_loop_new(NULL, FALSE);
+    ns_net_fetch_async(url, top_url, NULL, on_fetch_done, &st);
+    g_engine_blocking_depth++;
+    g_main_loop_run(st.loop);
+    g_engine_blocking_depth--;
+    g_main_loop_unref(st.loop);
+    if (error) *error = st.error;
+    else g_clear_error(&st.error);
+    return st.resp;
+}
+
+ns_response *
+ns_engine_post_blocking(const char *url, const char *top_url,
+                        const void *body, gsize body_len,
+                        const char *content_type, GError **error)
+{
+    fetch_state st = {0};
+    st.loop = g_main_loop_new(NULL, FALSE);
+    ns_net_post_async(url, top_url, body, body_len, content_type,
+                      NULL, on_fetch_done, &st);
+    g_engine_blocking_depth++;
+    g_main_loop_run(st.loop);
+    g_engine_blocking_depth--;
+    g_main_loop_unref(st.loop);
+    if (error) *error = st.error;
+    else g_clear_error(&st.error);
+    return st.resp;
+}
+
+static GBytes *
+fetch_css_bytes(const char *url, GHashTable *cache)
+{
+    if (!url || !*url) return NULL;
+    if (cache) {
+        GBytes *hit = g_hash_table_lookup(cache, url);
+        if (hit) return g_bytes_get_size(hit) ? g_bytes_ref(hit) : NULL;
+    }
+    ns_response *resp = ns_engine_fetch_blocking(url, NULL, NULL);
+    GBytes *bytes = NULL;
+    if (resp && !resp->error && resp->status < 400 &&
+        resp->body && resp->body->len > 0) {
+        bytes = g_bytes_new(resp->body->data, resp->body->len);
+        if (cache)
+            g_hash_table_insert(cache, g_strdup(url), g_bytes_ref(bytes));
+    } else if (cache) {
+        g_hash_table_insert(cache, g_strdup(url), g_bytes_new(NULL, 0));
+    }
+    if (resp) ns_response_free(resp);
+    return bytes;
+}
+
+static gboolean
+rel_has_token(const char *rel, const char *token)
+{
+    if (!rel || !token || !*token) return FALSE;
+    gchar **parts = g_strsplit_set(rel, " \t\r\n\f", -1);
+    gboolean found = FALSE;
+    for (gchar **p = parts; *p; p++) {
+        if (**p && g_ascii_strcasecmp(*p, token) == 0) {
+            found = TRUE;
+            break;
+        }
+    }
+    g_strfreev(parts);
+    return found;
+}
+
+static gboolean
+rel_is_stylesheet(const char *rel)
+{
+    return rel_has_token(rel, "stylesheet") &&
+           !rel_has_token(rel, "alternate");
+}
+
+static void
+append_stylesheet_expanded(GPtrArray *out, ns_css_stylesheet *sh,
+                           const char *base_url, GHashTable *seen,
+                           GHashTable *cache, int depth)
+{
+    if (!out || !sh) return;
+    if (depth < NS_CSS_IMPORT_MAX_DEPTH && sh->imports) {
+        for (guint i = 0; i < sh->imports->len; i++) {
+            ns_css_import *im = &g_array_index(sh->imports, ns_css_import, i);
+            if (!im->url || !*im->url) continue;
+            if (im->media && *im->media &&
+                !ns_css_media_query_matches(im->media))
+                continue;
+            char *abs = ns_url_resolve(base_url, im->url);
+            if (!abs) continue;
+            if (seen && g_hash_table_contains(seen, abs)) {
+                g_free(abs);
+                continue;
+            }
+            if (seen) g_hash_table_add(seen, g_strdup(abs));
+            GBytes *bytes = fetch_css_bytes(abs, cache);
+            if (bytes) {
+                gsize len = 0;
+                const char *data = g_bytes_get_data(bytes, &len);
+                ns_css_stylesheet *child =
+                    ns_css_stylesheet_parse(data, (gssize)len);
+                if (child) {
+                    if (im->layer_name)
+                        ns_css_stylesheet_force_layer(child, im->layer_name);
+                    append_stylesheet_expanded(out, child, abs, seen, cache,
+                                               depth + 1);
+                }
+                g_bytes_unref(bytes);
+            }
+            g_free(abs);
+        }
+    }
+    ns_css_stylesheet_resolve_urls(sh, base_url);
+    g_ptr_array_add(out, sh);
+}
+
+typedef struct {
+    GPtrArray  *out;
+    GHashTable *cache;
+    GString    *run;
+    const char *run_base;
+} sheet_collect_ctx;
+
+static void
+sheet_run_flush(sheet_collect_ctx *cc)
+{
+    if (!cc->run || cc->run->len == 0) return;
+    ns_css_stylesheet *sh =
+        ns_css_merged_styles_cached(cc->run->str, (gssize)cc->run->len);
+    if (sh) {
+        GHashTable *seen = g_hash_table_new_full(g_str_hash, g_str_equal,
+                                                 g_free, NULL);
+        append_stylesheet_expanded(cc->out, sh, cc->run_base, seen,
+                                   cc->cache, 0);
+        g_hash_table_destroy(seen);
+    }
+    g_string_set_size(cc->run, 0);
+    cc->run_base = NULL;
+}
+
+static void
+collect_stylesheets_walk(ns_node *n, const char *base_url,
+                         sheet_collect_ctx *cc)
+{
+    if (!n || ns_node_is_element_named(n, "noscript")) return;
+    if (ns_node_is_element_named(n, "iframe")) {
+        sheet_run_flush(cc);
+        const char *furl = ns_element_get_attr(n, "data-nd-frame-url");
+        if (furl && *furl) base_url = furl;
+    }
+    GPtrArray *out = cc->out;
+    GHashTable *cache = cc->cache;
+    if (ns_node_is_element_named(n, "style")) {
+        char *css = ns_css_style_element_text(n);
+        if (css) {
+            if (cc->run_base && cc->run_base != base_url)
+                sheet_run_flush(cc);
+            if (strstr(css, "@import")) {
+                sheet_run_flush(cc);
+                ns_css_stylesheet *sh =
+                    ns_css_stylesheet_from_style_element_cached(n);
+                if (sh) {
+                    GHashTable *seen =
+                        g_hash_table_new_full(g_str_hash, g_str_equal,
+                                              g_free, NULL);
+                    append_stylesheet_expanded(out, sh, base_url, seen,
+                                               cache, 0);
+                    g_hash_table_destroy(seen);
+                }
+            } else {
+                g_string_append(cc->run, css);
+                g_string_append_c(cc->run, '\n');
+                cc->run_base = base_url;
+            }
+            g_free(css);
+        }
+    } else if (ns_node_is_element_named(n, "link") && base_url) {
+        sheet_run_flush(cc);
+        const char *rel = ns_element_get_attr(n, "rel");
+        const char *href = ns_element_get_attr(n, "href");
+        const char *media = ns_element_get_attr(n, "media");
+        if (href && *href && rel_is_stylesheet(rel) &&
+            (!media || !*media || ns_css_media_query_matches(media))) {
+            char *abs = ns_url_resolve(base_url, href);
+            GBytes *bytes = fetch_css_bytes(abs, cache);
+            if (bytes) {
+                gsize len = 0;
+                const char *data = g_bytes_get_data(bytes, &len);
+                ns_css_stylesheet *sh =
+                    ns_css_stylesheet_parse_url_cached(abs, data, (gssize)len);
+                if (sh) {
+                    GHashTable *seen =
+                        g_hash_table_new_full(g_str_hash, g_str_equal,
+                                              g_free, NULL);
+                    if (abs) g_hash_table_add(seen, g_strdup(abs));
+                    append_stylesheet_expanded(out, sh, abs, seen, cache, 0);
+                    g_hash_table_destroy(seen);
+                }
+                g_bytes_unref(bytes);
+            }
+            g_free(abs);
+        }
+    }
+    for (ns_node *c = n->first_child; c; c = c->next_sibling)
+        collect_stylesheets_walk(c, base_url, cc);
+}
+
+void
+ns_engine_collect_stylesheets(ns_node *doc, const char *base_url,
+                              GPtrArray *out, GHashTable *css_cache)
+{
+    sheet_collect_ctx cc = {
+        .out = out, .cache = css_cache,
+        .run = g_string_new(NULL), .run_base = NULL,
+    };
+    collect_stylesheets_walk(doc, base_url, &cc);
+    sheet_run_flush(&cc);
+    g_string_free(cc.run, TRUE);
+}
+
+GHashTable *
+ns_engine_compute_cascade(ns_node *doc, const char *base_url,
+                          GHashTable *css_cache)
+{
+    ns_css_style_element_cache_begin();
+    GPtrArray *page_sheets = g_ptr_array_new();
+    ns_engine_collect_stylesheets(doc, base_url, page_sheets, css_cache);
+    GHashTable *styles = ns_css_compute(doc,
+        (const ns_css_stylesheet *const *)page_sheets->pdata,
+        page_sheets->len);
+    for (guint i = 0; i < page_sheets->len; i++)
+        ns_css_stylesheet_free(g_ptr_array_index(page_sheets, i));
+    g_ptr_array_free(page_sheets, TRUE);
+    return styles;
+}
+
+GHashTable *
+ns_engine_relayout(ns_node *doc, const char *base_url,
+                   int viewport_width, double viewport_height,
+                   ns_image_cache *images, ns_anim *anim,
+                   ns_js *js, GHashTable *css_cache,
+                   const ns_node *focused, const ns_node *hover,
+                   gsize caret_byte,
+                   gsize sel_anchor_byte, ns_box **out_layout)
+{
+    ns_css_style_element_cache_begin();
+    GPtrArray *sheets = g_ptr_array_new();
+    ns_engine_collect_stylesheets(doc, base_url, sheets, css_cache);
+
+    ns_render_ctx rc = {
+        .doc             = doc,
+        .sheets          = (const ns_css_stylesheet *const *)sheets->pdata,
+        .n_sheets        = sheets->len,
+        .viewport_width  = (double)viewport_width,
+        .viewport_height = viewport_height > 0 ? viewport_height
+                                               : (double)viewport_width * 0.75,
+        .zoom            = 1.0,
+        .images          = images,
+        .base_url        = base_url,
+        .anim            = anim,
+        .js              = js,
+        .focused_input   = focused,
+        .hover_node      = hover,
+        .caret_byte      = caret_byte,
+        .sel_anchor_byte = sel_anchor_byte,
+    };
+    static int profile_env = -1;
+    if (profile_env < 0)
+        profile_env = g_getenv("NS_PROFILE") != NULL ? 1 : 0;
+    GHashTable *styles;
+    if (profile_env) {
+        ns_render_profile prof;
+        gint64 t0 = g_get_monotonic_time();
+        styles = ns_render_relayout_profile(&rc, out_layout, &prof);
+        gint64 total = g_get_monotonic_time() - t0;
+        guint nstyles = styles ? g_hash_table_size(styles) : 0u;
+        g_printerr("[profile] relayout vw=%d nodes=%u total=%.2fms "
+                   "css=%.2f style=%.2f layout=%.2f",
+                   viewport_width, nstyles, total / 1000.0,
+                   prof.css1_us / 1000.0, prof.style1_us / 1000.0,
+                   prof.layout1_us / 1000.0);
+        if (prof.container_pass)
+            g_printerr(" | containers=%u cq_collect=%.2f css2=%.2f style2=%.2f "
+                       "layout2=%.2f",
+                       prof.containers, prof.container_us / 1000.0,
+                       prof.css2_us / 1000.0, prof.style2_us / 1000.0,
+                       prof.layout2_us / 1000.0);
+        g_printerr("\n");
+    } else {
+        styles = ns_render_relayout(&rc, out_layout);
+    }
+    ns_debug_log_emit(NS_DLOG_RENDER, "relayout", "styles=%u vw=%d",
+                      styles ? g_hash_table_size(styles) : 0u, viewport_width);
+
+    for (guint i = 0; i < sheets->len; i++)
+        ns_css_stylesheet_free(g_ptr_array_index(sheets, i));
+    g_ptr_array_free(sheets, TRUE);
+    return styles;
+}
+
+void
+ns_engine_load_keyframes(ns_anim *anim, ns_node *doc, const char *base_url,
+                         GHashTable *css_cache)
+{
+    if (!anim) return;
+    GPtrArray *sheets = g_ptr_array_new();
+    ns_engine_collect_stylesheets(doc, base_url, sheets, css_cache);
+    for (guint i = 0; i < sheets->len; i++) {
+        const ns_css_stylesheet *sh = g_ptr_array_index(sheets, i);
+        if (sh) ns_anim_load_from_stylesheet(anim, sh);
+    }
+    for (guint i = 0; i < sheets->len; i++)
+        ns_css_stylesheet_free(g_ptr_array_index(sheets, i));
+    g_ptr_array_free(sheets, TRUE);
+}
+
+void
+ns_engine_anim_observe(ns_anim *anim, GHashTable *styles, gint64 now_us)
+{
+    if (!anim || !styles) return;
+    GHashTableIter it;
+    gpointer key, val;
+    g_hash_table_iter_init(&it, styles);
+    while (g_hash_table_iter_next(&it, &key, &val))
+        ns_anim_observe(anim, (const ns_node *)key, (const ns_style *)val, now_us);
+    ns_anim_prune(anim, styles);
+}
+
+typedef struct {
+    GMainLoop      *loop;
+    int             pending;
+    ns_image_cache *cache;
+} imgs_fetch_state;
+
+typedef struct {
+    imgs_fetch_state *st;
+    char             *abs;
+} img_fetch_item;
+
+static void
+on_image_fetch_done(GObject *src, GAsyncResult *result, gpointer user_data)
+{
+    (void)src;
+    img_fetch_item *it = user_data;
+    GError *err = NULL;
+    ns_response *resp = ns_net_fetch_finish(result, &err);
+    if (resp && !resp->error && resp->body && resp->body->len > 0) {
+        int w = 0, h = 0;
+        ns_texture *tex = ns_image_decode_bytes(resp->body->data,
+                                                resp->body->len, &w, &h);
+        if (tex)
+            ns_image_cache_insert_loaded(it->st->cache, it->abs, tex, w, h);
+    }
+    if (resp) ns_response_free(resp);
+    g_clear_error(&err);
+    if (--it->st->pending == 0)
+        g_main_loop_quit(it->st->loop);
+    g_free(it->abs);
+    g_free(it);
+}
+
+void
+ns_engine_fetch_images(ns_box *root, const char *base_url,
+                       ns_image_cache *cache)
+{
+    if (!root || !base_url || !cache) return;
+    GPtrArray *imgs = g_ptr_array_new();
+    ns_layout_collect_images(root, imgs);
+    GHashTable *wanted = g_hash_table_new_full(g_str_hash, g_str_equal,
+                                               g_free, NULL);
+    for (guint i = 0; i < imgs->len; i++) {
+        ns_box *box = g_ptr_array_index(imgs, i);
+        if (!box->media) continue;
+        GPtrArray *srcs = g_ptr_array_new();
+        if (box->media->image_src)
+            g_ptr_array_add(srcs, box->media->image_src);
+        else if (box->media->bg_layer_srcs) {
+            for (guint li = 0; li < box->media->bg_layer_srcs->len; li++) {
+                char *lsrc = g_ptr_array_index(box->media->bg_layer_srcs, li);
+                if (lsrc) g_ptr_array_add(srcs, lsrc);
+            }
+        } else if (box->media->bg_image_src)
+            g_ptr_array_add(srcs, box->media->bg_image_src);
+        if (box->media->marker_image_src)
+            g_ptr_array_add(srcs, box->media->marker_image_src);
+        for (guint si = 0; si < srcs->len; si++) {
+            const char *src = g_ptr_array_index(srcs, si);
+            if (g_str_has_prefix(src, "nd-inline-svg:")) continue;
+            char *abs = ns_url_resolve(base_url, src);
+            if (!abs) continue;
+            if (ns_image_cache_peek(cache, abs) ||
+                g_hash_table_contains(wanted, abs)) {
+                g_free(abs);
+                continue;
+            }
+            g_hash_table_add(wanted, abs);
+        }
+        g_ptr_array_free(srcs, TRUE);
+    }
+    g_ptr_array_free(imgs, TRUE);
+
+    guint n = g_hash_table_size(wanted);
+    if (n == 0) {
+        g_hash_table_destroy(wanted);
+        return;
+    }
+
+    imgs_fetch_state st = {0};
+    st.loop = g_main_loop_new(NULL, FALSE);
+    st.pending = (int)n;
+    st.cache = cache;
+
+    GHashTableIter it;
+    gpointer key;
+    g_hash_table_iter_init(&it, wanted);
+    while (g_hash_table_iter_next(&it, &key, NULL)) {
+        img_fetch_item *item = g_new0(img_fetch_item, 1);
+        item->st = &st;
+        item->abs = g_strdup(key);
+        ns_net_fetch_async(item->abs, base_url, NULL,
+                           on_image_fetch_done, item);
+    }
+    g_engine_blocking_depth++;
+    g_main_loop_run(st.loop);
+    g_engine_blocking_depth--;
+    g_main_loop_unref(st.loop);
+    g_hash_table_destroy(wanted);
+}
+
+static void
+walk_max_bottom(const ns_box *b, double *out)
+{
+    if (!b) return;
+    double bottom = b->y + b->content_height;
+    if (bottom > *out) *out = bottom;
+    for (const ns_box *c = b->first_child; c; c = c->next_sibling)
+        walk_max_bottom(c, out);
+}
+
+int
+ns_engine_write_png(const ns_box *root, const char *path)
+{
+    if (!root || !path) return 2;
+    const int kCairoMax = 30000;
+    double cw = root->content_width;
+    if (!(cw > 0)) cw = 1024;
+    if (cw > kCairoMax) cw = kCairoMax;
+    int w = (int)cw;
+    double max_bottom = root->content_height;
+    walk_max_bottom(root, &max_bottom);
+    if (!(max_bottom > 0)) max_bottom = 0;
+    if (max_bottom > (double)kCairoMax) max_bottom = kCairoMax;
+    int h = (int)max_bottom + 32;
+    if (h <= 0) h = 768;
+    if (w > kCairoMax) w = kCairoMax;
+    if (h > kCairoMax) {
+        fprintf(stderr,
+            "engine: page is %d px tall; PNG capped at %d (cairo limit)\n",
+            h, kCairoMax);
+        h = kCairoMax;
+    }
+    cairo_surface_t *surf = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, w, h);
+    if (cairo_surface_status(surf) != CAIRO_STATUS_SUCCESS) {
+        cairo_surface_destroy(surf);
+        fprintf(stderr, "engine: failed to create PNG surface\n");
+        return 2;
+    }
+    cairo_t *cr = cairo_create(surf);
+    ns_paint(cr, root, NULL);
+    cairo_destroy(cr);
+    cairo_status_t st = cairo_surface_write_to_png(surf, path);
+    cairo_surface_destroy(surf);
+    if (st != CAIRO_STATUS_SUCCESS) {
+        fprintf(stderr, "engine: PNG write failed: %s\n",
+                cairo_status_to_string(st));
+        return 2;
+    }
+    return 0;
+}
+
+int
+ns_engine_write_pdf(const ns_box *root, const char *path)
+{
+    if (!root || !path) return 2;
+    double w = root->content_width > 0 ? root->content_width : 595.0;
+    double h = root->content_height > 0 ? (root->content_height + 32) : 842.0;
+    cairo_surface_t *surf = cairo_pdf_surface_create(path, w, h);
+    if (cairo_surface_status(surf) != CAIRO_STATUS_SUCCESS) {
+        cairo_surface_destroy(surf);
+        fprintf(stderr, "engine: failed to create PDF surface\n");
+        return 2;
+    }
+    cairo_t *cr = cairo_create(surf);
+    ns_paint(cr, root, NULL);
+    cairo_show_page(cr);
+    cairo_destroy(cr);
+    cairo_surface_destroy(surf);
+    return 0;
+}
+
+void
+ns_engine_dump_text(const ns_box *b, GString *out)
+{
+    if (!b) return;
+    if (b->kind == NS_BOX_INLINE && b->text && *b->text) {
+        g_string_append(out, b->text);
+        g_string_append_c(out, '\n');
+    } else if (b->kind == NS_BOX_IMAGE && b->dom) {
+        const char *alt = ns_element_get_attr(b->dom, "alt");
+        const char *src = b->media ? b->media->image_src : NULL;
+        if (alt && *alt) g_string_append_printf(out, "[image: %s]\n", alt);
+        else if (src)    g_string_append_printf(out, "[image: %s]\n", src);
+        else             g_string_append(out, "[image]\n");
+    }
+    for (const ns_box *c = b->first_child; c; c = c->next_sibling)
+        ns_engine_dump_text(c, out);
+}
+
+void
+ns_engine_dump_layout(const ns_box *b, int indent, GString *out)
+{
+    if (!b) return;
+    for (int i = 0; i < indent; i++) g_string_append_c(out, ' ');
+    g_string_append_printf(out, "%s @(%.0f,%.0f) %.0fx%.0f",
+        ns_box_kind_name(b->kind), b->x, b->y,
+        b->content_width, b->content_height);
+    if (b->dom && b->dom->name) g_string_append_printf(out, " <%s>", b->dom->name);
+    if (b->media && b->media->image_src)
+        g_string_append_printf(out, " img=%s", b->media->image_src);
+    if (b->text && *b->text) {
+        gsize n = strlen(b->text);
+        if (n > 40) {
+            g_string_append_printf(out, " text=\"%.40s…\"", b->text);
+        } else {
+            g_string_append_printf(out, " text=\"%s\"", b->text);
+        }
+    }
+    g_string_append_c(out, '\n');
+    for (const ns_box *c = b->first_child; c; c = c->next_sibling)
+        ns_engine_dump_layout(c, indent + 2, out);
+}
+
+char *
+ns_engine_suffix_before_ext(const char *path, const char *suffix)
+{
+    if (!path) return NULL;
+    const char *slash = strrchr(path, '/');
+    const char *back  = strrchr(path, '\\');
+    if (back && (!slash || back > slash)) slash = back;
+    const char *dot = strrchr(path, '.');
+    if (dot && (!slash || dot > slash))
+        return g_strdup_printf("%.*s%s%s",
+                               (int)(dot - path), path, suffix, dot);
+    return g_strconcat(path, suffix, NULL);
+}

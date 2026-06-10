@@ -1,0 +1,85 @@
+/* Nordstjernen — HTTP renderer IPC client (experiment; mirrors rproc.h). */
+
+#ifndef NS_RPROC_HTTP_H
+#define NS_RPROC_HTTP_H
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef struct ns_rproc_http ns_rproc_http;
+
+typedef struct {
+    int   ok;
+    int   page_width;
+    int   page_height;
+    char *title;
+    char *url;
+    char *nav;
+} ns_rproc_http_page;
+
+typedef struct {
+    int                  ok;
+    int                  width;
+    int                  height;
+    int                  stride;
+    int                  animating;
+    const unsigned char *pixels;
+    char                *nav;
+    char                *webgl;
+} ns_rproc_http_frame;
+
+ns_rproc_http *ns_rproc_http_spawn(const char *renderer_path, int max_width,
+                                   int max_height);
+ns_rproc_http *ns_rproc_http_spawn_shm(const char *renderer_path,
+                                       int max_width, int max_height);
+int  ns_rproc_http_open(ns_rproc_http *r, const char *url, int viewport_width,
+                        int viewport_height, int settle_ms,
+                        ns_rproc_http_page *out);
+int  ns_rproc_http_render(ns_rproc_http *r, int width, int height,
+                          int scroll_x, int scroll_y, double scale,
+                          ns_rproc_http_frame *out);
+char *ns_rproc_http_link_at(ns_rproc_http *r, int x, int y);
+char *ns_rproc_http_click(ns_rproc_http *r, int x, int y, int mods);
+char *ns_rproc_http_select(ns_rproc_http *r, int kind, int x, int y);
+char *ns_rproc_http_key(ns_rproc_http *r, int kind, const char *key,
+                        const char *code, int keycode, int mods);
+int   ns_rproc_http_hover(ns_rproc_http *r, int x, int y);
+int   ns_rproc_http_find(ns_rproc_http *r, const char *query,
+                         int case_sensitive, int direction, int from_y,
+                         int *out_total, int *out_current, int *out_scroll_y);
+int   ns_rproc_http_set_viewport(ns_rproc_http *r, int width, int height,
+                                 ns_rproc_http_page *out);
+int   ns_rproc_http_resolve_webgl(ns_rproc_http *r, const char *origin,
+                                  int allow);
+char *ns_rproc_http_eval(ns_rproc_http *r, const char *src);
+char *ns_rproc_http_console_poll(ns_rproc_http *r);
+char *ns_rproc_http_media_at(ns_rproc_http *r, int x, int y, int *out_is_video,
+                             int *out_stream);
+int   ns_rproc_http_export(ns_rproc_http *r, const char *path);
+
+void ns_rproc_http_page_clear(ns_rproc_http_page *out);
+void ns_rproc_http_close(ns_rproc_http *r);
+
+/* Unblock a blocking IPC read in progress (called from another thread) so a
+   wedged renderer cannot stall the caller; the in-flight request fails. */
+void ns_rproc_http_interrupt(ns_rproc_http *r);
+
+/* OS process id of the renderer (-1 if none), and forceful termination. */
+int  ns_rproc_http_pid(ns_rproc_http *r);
+void ns_rproc_http_terminate(ns_rproc_http *r);
+
+/* Forcefully kill an OS process by pid (cross-platform). */
+void ns_proc_kill(int pid);
+
+/* Best-effort process introspection for a task-manager UI. Fills state with a
+   short word ("running"/"sleeping"/"terminated"/...) and rss_kb with resident
+   memory in KiB (-1 if unavailable). Returns non-zero if the process is alive.
+   Full data on Linux; liveness/state only elsewhere. */
+int  ns_rproc_http_proc_info(int pid, char *state, int state_sz, long *rss_kb);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif
