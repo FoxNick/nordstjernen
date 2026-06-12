@@ -1,0 +1,155 @@
+/* Nordstjernen — HTTP/JSON renderer server (IPC experiment, pixels in body). */
+
+#define _GNU_SOURCE
+#include "ipc_http.h"
+#include "libnordstjernen.h"
+#include "renderer_serve.h"
+
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <fcntl.h>
+#include <io.h>
+#include <windows.h>
+#else
+#include <signal.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
+#endif
+
+int
+main(int argc, char **argv)
+{
+    if (argc < 3)
+        return 2;
+    int max_w = atoi(argv[1]);
+    int max_h = atoi(argv[2]);
+    if (max_w <= 0 || max_h <= 0)
+        return 2;
+
+#ifdef __linux__
+    prctl(PR_SET_PDEATHSIG, SIGKILL);
+    if (getppid() == 1)
+        return 0;
+#endif
+
+    int shm_mode = argc > 3 && strcmp(argv[3], "shm") == 0;
+    size_t fb_size = (size_t)max_w * (size_t)max_h * 4u;
+    unsigned char *fb;
+
+#ifdef _WIN32
+    HANDLE proc = GetCurrentProcess();
+    HANDLE ipc_in = NULL, ipc_out = NULL;
+    if (!DuplicateHandle(proc, GetStdHandle(STD_INPUT_HANDLE), proc, &ipc_in, 0,
+                         FALSE, DUPLICATE_SAME_ACCESS) ||
+        !DuplicateHandle(proc, GetStdHandle(STD_OUTPUT_HANDLE), proc, &ipc_out,
+                         0, FALSE, DUPLICATE_SAME_ACCESS))
+        return 2;
+    HANDLE nul_in = CreateFileA("NUL", GENERIC_READ,
+                                FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                                OPEN_EXISTING, 0, NULL);
+    HANDLE nul_out = CreateFileA("NUL", GENERIC_WRITE,
+                                 FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                                 OPEN_EXISTING, 0, NULL);
+    if (nul_in != INVALID_HANDLE_VALUE)
+        SetStdHandle(STD_INPUT_HANDLE, nul_in);
+    if (nul_out != INVALID_HANDLE_VALUE)
+        SetStdHandle(STD_OUTPUT_HANDLE, nul_out);
+    FILE *redir_in = freopen("NUL", "r", stdin);
+    FILE *redir_out = freopen("NUL", "w", stdout);
+    (void)redir_in;
+    (void)redir_out;
+    int ctrl_r = _open_osfhandle((intptr_t)ipc_in, _O_BINARY);
+    int ctrl_w = _open_osfhandle((intptr_t)ipc_out, _O_BINARY);
+    if (ctrl_r < 0 || ctrl_w < 0)
+        return 2;
+    HANDLE shm_handle = NULL;
+    if (shm_mode) {
+        if (argc < 5)
+            return 2;
+        shm_handle = (HANDLE)(uintptr_t)_strtoui64(argv[4], NULL, 10);
+        fb = MapViewOfFile(shm_handle, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0,
+                           fb_size);
+        if (!fb)
+            return 2;
+    } else {
+        fb = malloc(fb_size);
+        if (!fb)
+            return 2;
+    }
+#else
+    signal(SIGPIPE, SIG_IGN);
+    int ctrl_r = 3, ctrl_w = 3;
+    if (shm_mode) {
+        int fd = http_recv_fd(ctrl_r);
+        if (fd < 0)
+            return 2;
+        fb = mmap(NULL, fb_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        close(fd);
+        if (fb == MAP_FAILED)
+            return 2;
+    } else {
+        fb = malloc(fb_size);
+        if (!fb)
+            return 2;
+    }
+#endif
+
+    if (ns_browser_init() != 0) {
+        free(fb);
+        return 2;
+    }
+    ns_browser_sandbox(argv[0]);
+
+    http_set_bufsize(ctrl_r, (int)fb_size + 65536);
+    http_set_bufsize(ctrl_w, (int)fb_size + 65536);
+
+    ns_renderer_session *session =
+        ns_renderer_session_new(ctrl_w, fb, max_w, max_h, shm_mode);
+    if (!session)
+        return 2;
+
+    http_conn c;
+    http_conn_init(&c, ctrl_r);
+
+    for (;;) {
+        http_head head;
+        if (http_read_head(&c, &head) != 0)
+            break;
+
+        char *body = NULL;
+        if (head.content_length > 0) {
+            body = malloc((size_t)head.content_length + 1);
+            if (!body || http_read_body(&c, head.content_length, body) != 0) {
+                free(body);
+                break;
+            }
+            body[head.content_length] = '\0';
+        }
+
+        int quit = ns_renderer_session_handle(session, &head, body);
+        free(body);
+        if (quit)
+            break;
+    }
+
+    ns_renderer_session_free(session);
+    ns_browser_shutdown();
+    if (!shm_mode)
+        free(fb);
+#ifdef _WIN32
+    else
+        UnmapViewOfFile(fb);
+#else
+    else
+        munmap(fb, fb_size);
+#endif
+    return 0;
+}

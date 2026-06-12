@@ -1,0 +1,176 @@
+# Nordstjernen on Android — build & Google Play release
+
+The Android port lives in [`android/`](../android). This document is the
+**release** guide: how to build, sign, and ship to the Google Play Store.
+For the engineering architecture, see [`android/README.md`](../android/README.md).
+F-Droid is a separate, easier track and is out of scope here.
+
+## Distribution model
+
+Free, ad-free, no-telemetry, no in-app purchase, no subscription — the
+Android build matches the desktop build. There is nothing to bill for, so
+there is no Play Billing, no AdMob, and no Advertising ID. Donations and
+commercial support are arranged off-Play at `nordstjernen.org`; Play ships
+the free binary only. Treat Play as reach and reputation.
+
+## The port in brief
+
+- Kotlin UI shell over the C embedding API (`src/libnordstjernen.h`) through a
+  thin JNI bridge — URL bar, history, reload, scroll/fling, tap-to-follow-link,
+  and `http(s)` `VIEW` intents.
+- The same clean-room engine, cross-compiled to a per-ABI `libnordstjernen.so`.
+  On Android it drops GTK 4, librsvg and gdk-pixbuf (see `android/README.md`),
+  so its only native deps are the GLib/cairo/pango stack plus
+  libcurl/sqlite3/uchardet/libpsl — all plain C, no Rust.
+- Targets: `compileSdk`/`targetSdk` **36**, `minSdk` **26**; ABIs
+  **arm64-v8a** + **x86_64** (add `armeabi-v7a` once its sysroot builds).
+  AGP 8.11.1, Gradle 8.14.5, NDK r27, JDK 17.
+
+## Building
+
+```sh
+cd android
+gradle wrapper                 # once, to generate ./gradlew (or use a system gradle)
+./gradlew assembleDebug        # APK -> app/build/outputs/apk/debug/
+./gradlew bundleRelease        # AAB -> app/build/outputs/bundle/release/  (Play upload)
+```
+
+`bundleRelease` is signed only when `android/keystore.properties` exists (see
+[Signing](#signing)); otherwise it is unsigned. Play requires the App Bundle
+(`.aab`) for new apps.
+
+### Native engine (.so)
+
+`android/scripts/build-deps.sh <abi> <api>` generates an NDK meson cross-file,
+cross-compiles the engine against a dependency sysroot
+(`NORDSTJERNEN_ANDROID_SYSROOT`), and stages it into `jniLibs/<abi>/`. While
+that file is absent, `CMakeLists.txt` links a **stub** bridge so the APK still
+builds and runs (engine reported unavailable); once present, the real bridge is
+linked and pages render.
+
+Cross-building the sysroot (glib, gobject, gio, gmodule, cairo, pango,
+pangocairo, harfbuzz, freetype, fontconfig and their transitive C deps, plus
+libcurl, sqlite3, uchardet, libpsl) is the remaining porting work. It is all
+plain C and builds with meson against the NDK.
+
+## Signing
+
+Use **Play App Signing** (the default for new apps): Google holds the signing
+key, you hold the *upload* key. A lost upload key is recoverable via Play
+support; if you opt out and lose the signing key the app is dead, so don't opt
+out. Back the upload key + passwords up in two places and test the backup
+yearly.
+
+1. Generate the upload key once:
+
+   ```sh
+   keytool -genkey -v -keystore nordstjernen-upload.jks \
+       -alias upload -keyalg RSA -keysize 4096 -validity 25000
+   ```
+
+2. Create `android/keystore.properties` — **git-ignored, never commit**:
+
+   ```properties
+   storeFile=/secure/path/nordstjernen-upload.jks
+   storePassword=…
+   keyAlias=upload
+   keyPassword=…
+   ```
+
+   `app/build.gradle` picks this up and signs `release` builds automatically.
+
+## Play policy — the non-negotiables
+
+(Verified against Play policy as of June 2026.)
+
+- **Target API level.** From **31 August 2026** every new app and update must
+  target **Android 16 (API 36)**; existing apps must target at least API 35 to
+  stay visible to new users ([policy](https://developer.android.com/google/play/requirements/target-sdk)).
+  The project targets 36. `compileSdk 36` needs AGP ≥ 8.9.1, hence the AGP
+  8.11.1 pin. Expect the bar to move up one API level every August.
+- **16 KB page sizes.** Since **1 November 2025** (final extension 31 May
+  2026), all submissions targeting Android 15+ must run on devices with 16 KB
+  memory pages ([docs](https://developer.android.com/guide/practices/page-sizes)).
+  Pure-JVM apps pass automatically; ours ships native `.so`s, so every ELF
+  segment must be 16 KB-aligned. Wired in three places: AGP ≥ 8.5.1 zip-aligns
+  packaging (covered by 8.11.1), the CMake bridge build passes
+  `-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON` (needed on NDK r27; r28+ aligns
+  by default), and `build-deps.sh` puts `-Wl,-z,max-page-size=16384` in the
+  meson cross-file for the engine and expects the dependency sysroot to be
+  built the same way. Verify with APK Analyzer or
+  `llvm-readelf -lW libnordstjernen.so` (LOAD segments' `Align` ≥ 0x4000)
+  before uploading.
+- **Edge-to-edge.** Targeting API 36 enforces edge-to-edge drawing and
+  disables the Android 15 opt-out attribute on Android 16+ devices
+  ([behavior changes](https://developer.android.com/about/versions/16/behavior-changes-16)).
+  `MainActivity` calls `enableEdgeToEdge()` and applies system-bar / cutout /
+  IME insets as root padding, so the toolbar and page never sit under bars.
+- **Developer verification.** Verify the developer account identity (D-U-N-S
+  number for organisations). From **September 2026** unverified developers'
+  apps stop installing on certified Android devices in the first wave of
+  countries — this now covers distribution *outside* Play too, so it gates the
+  F-Droid/sideload story as well, not just the Play listing.
+- **Data safety form.** Declare *no data collected, no data shared, encrypted
+  in transit, deletion via uninstall* — all true. Play surfaces this on the
+  listing.
+- **Permissions.** Only `INTERNET` + `ACCESS_NETWORK_STATE` (already in the
+  manifest). No notifications, location, contacts, camera, or microphone. Add
+  `READ_MEDIA_IMAGES` only when `<input type=file>` upload lands.
+- **Content rating.** The IARC questionnaire puts an open-web browser at
+  **Teen** / **PEGI 12**. Answer truthfully; don't claim Everyone.
+- **Browsers category.** Don't impersonate other browsers in name/icon; let the
+  user change the default search engine; keep the `http`/`https` `VIEW` filter
+  (already present). The app requests `RoleManager.ROLE_BROWSER` once on first
+  launch (Android 10+), which shows the system default-browser chooser; the
+  user can change it any time in Settings, so it never re-prompts.
+- **Privacy policy.** Every listing needs a privacy policy URL, even with an
+  all-"No" data safety form. Point it at a page on `nordstjernen.org` stating
+  the obvious: no collection, no telemetry, browsing data stays on the device.
+  Cloud backup is disabled in the manifest (`allowBackup="false"`), so history
+  and cookies never leave the device through Google's backups either.
+- **Don't wire** the Play Integrity API or any ads/advertising-ID SDK.
+
+## Submission & rollout
+
+1. **Store listing** — name, 80-char short and 4000-char full descriptions,
+   512×512 icon, 1024×500 feature graphic, 2–8 phone screenshots (captured from
+   a real-engine build), category **Browsers**.
+2. **Forms** — complete data safety + content rating (above).
+3. **Internal testing** — upload the first signed AAB; review takes minutes.
+4. **Closed testing** — a personal developer account (created after Nov 2023)
+   needs **≥12 testers opted in for 14 consecutive days** before it can apply
+   for production, followed by a production-access questionnaire; organisation
+   accounts are exempt. Recruit a few spare testers — only continuously
+   opted-in ones count.
+5. **Production** — first browser review takes 3–7 days; roll out in stages
+   (10% → 100%) watching the crash dashboard.
+
+Versioning: `versionCode` is a monotonic int; `versionName` tracks the desktop
+version ("1.0.x"). For a critical security fix, halt rollout, then re-submit
+on a fast rollout.
+
+## CI
+
+`.github/workflows/android.yml` builds the debug APK on every push/PR (stub
+engine until a sysroot is wired) and captures an emulator screenshot.
+
+`.github/workflows/android-release.yml` is the Play build: trigger it manually
+(`workflow_dispatch`), and it runs `gradle bundleRelease` and uploads the
+`.aab` artifact. It signs with the upload key when these repository secrets
+are set, and builds an unsigned bundle otherwise:
+
+| Secret | Content |
+| --- | --- |
+| `ANDROID_UPLOAD_KEYSTORE_BASE64` | `base64 -w0 nordstjernen-upload.jks` |
+| `ANDROID_KEYSTORE_PASSWORD` | keystore password |
+| `ANDROID_KEY_ALIAS` | `upload` |
+| `ANDROID_KEY_PASSWORD` | key password |
+
+Nothing auto-publishes — download the artifact and upload it to the Play
+Console internal track by hand.
+
+## Out of scope
+
+- **F-Droid** — separate track; reproducible builds are the only twist.
+- **Samsung / Huawei / Amazon stores** — year-two store-listing ports.
+- **iOS** — different document, much worse cost/benefit.
