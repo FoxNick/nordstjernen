@@ -45,13 +45,20 @@ if cc.has_argument('-D_FORTIFY_SOURCE=3')
   fortify_level = '-D_FORTIFY_SOURCE=3'
 endif
 
+auto_var_init_flags = []
+if cc.has_argument('-ftrivial-auto-var-init=pattern')
+  auto_var_init_flags = ['-ftrivial-auto-var-init=pattern']
+elif cc.has_argument('-ftrivial-auto-var-init=zero')
+  auto_var_init_flags = ['-ftrivial-auto-var-init=zero']
+endif
+
 hardening_c_flags = [
   '-fstack-protector-strong',
   '-fstack-clash-protection',
   '-fcf-protection=full',
   '-U_FORTIFY_SOURCE',
   fortify_level,
-]
+] + auto_var_init_flags
 
 hardening_link_flags = [
   '-Wl,-z,relro',
@@ -70,6 +77,22 @@ add_project_link_arguments(
   cc.get_supported_link_arguments(hardening_link_flags),
   language: 'c',
 )
+
+cfi_feature = get_option('cfi')
+if not cfi_feature.disabled()
+  cfi_args = ['-flto', '-fsanitize=cfi', '-fvisibility=hidden']
+  cfi_supported = (cc.get_id() == 'clang' and
+                   cc.links('int main(void) { return 0; }',
+                            name: 'cfi + lto support',
+                            args: cfi_args))
+  if cfi_supported
+    add_project_arguments(cfi_args, language: 'c')
+    add_project_link_arguments(cfi_args, language: 'c')
+    message('CFI: enabled (' + ' '.join(cfi_args) + ')')
+  elif cfi_feature.enabled()
+    error('cfi=enabled requires Clang with LTO and the cfi sanitizer; not found')
+  endif
+endif
 
 ns_buildtype = get_option('buildtype')
 ns_is_release = (ns_buildtype == 'release' or ns_buildtype == 'minsize')

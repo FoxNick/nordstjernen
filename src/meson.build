@@ -315,14 +315,28 @@ if not is_android
     rproc_deps += [cc.find_library('rt', required: false)]
   endif
 
+  scudo_feature = get_option('scudo')
+  scudo_args = []
+  if not scudo_feature.disabled()
+    scudo_available = cc.get_id() == 'clang' and cc.has_link_argument('-fsanitize=scudo')
+    if scudo_available
+      scudo_args = ['-fsanitize=scudo']
+    elif scudo_feature.enabled()
+      error('scudo=enabled requires Clang with the scudo standalone runtime ' +
+            '(Debian/Ubuntu: libclang-rt-<ver>-dev); not found')
+    endif
+  endif
+  message('nordstjernen-renderer allocator: ' +
+          (scudo_args.length() > 0 ? 'scudo (hardened)' : 'system default'))
+
   executable(
     'nordstjernen-renderer',
     files('renderer_http.c', 'renderer_serve.c', 'ipc_http.c'),
     link_with: libnordstjernen_static,
     include_directories: include_directories('.'),
     dependencies: nordstjernen_deps + ns_sdl_deps + rproc_deps,
-    c_args: ns_lib_c_args,
-    link_args: nordstjernen_exe_link_args,
+    c_args: ns_lib_c_args + scudo_args,
+    link_args: nordstjernen_exe_link_args + scudo_args,
     install: true,
   )
 
