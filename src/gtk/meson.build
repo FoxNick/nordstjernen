@@ -31,6 +31,11 @@ nordstjernen_icon_resources = gnome.compile_resources(
   c_name: 'nordstjernen_icons',
 )
 
+nordstjernen_gtk_c_args = ['-DNS_HAVE_GTK=1']
+if have_graphics_offload
+  nordstjernen_gtk_c_args += '-DNS_HAVE_GRAPHICS_OFFLOAD=1'
+endif
+
 executable(
   'nordstjernen',
   nordstjernen_engine_sources + nordstjernen_app_sources +
@@ -38,7 +43,7 @@ executable(
     nordstjernen_icon_resources +
     nordstjernen_win_resources + [polyfills_h, wpt_hook_h],
   dependencies: nordstjernen_gtk_deps,
-  c_args: ['-DNS_HAVE_GTK=1'],
+  c_args: nordstjernen_gtk_c_args,
   include_directories: include_directories('..', '.'),
   win_subsystem: nordstjernen_win_subsystem,
   link_args: nordstjernen_exe_link_args + nordstjernen_gtk_platform_link_args,

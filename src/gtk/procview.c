@@ -160,6 +160,15 @@ struct NsProcView {
     guint             vid_tick_id;
     guint             vid_tick_count;
     gint64            vid_resync_us;
+#ifdef NS_HAVE_GRAPHICS_OFFLOAD
+    /* EXPERIMENTAL: when built with -Dgraphics_offload=enabled and not disabled
+       at runtime (NS_GRAPHICS_OFFLOAD=0), the <video> overlay is presented as a
+       GtkPicture inside a GtkGraphicsOffload so the compositor can scan the
+       video out as its own subsurface, instead of Cairo-blitting every frame
+       into the drawing area. Both are NULL in the Cairo path. */
+    GtkWidget        *vid_offload;   /* GtkGraphicsOffload */
+    GtkWidget        *vid_picture;   /* GtkPicture (child of vid_offload) */
+#endif
 
     NsProcNotify notify;
     gpointer     notify_ud;
@@ -723,6 +732,100 @@ typedef struct {
 
 #define NS_VRING_MAGIC 0x4e535646u
 
+/* ---- EXPERIMENTAL: GtkGraphicsOffload path for the <video> overlay -------- *
+ * Behind -Dgraphics_offload=enabled (NS_HAVE_GRAPHICS_OFFLOAD). When active the
+ * decoded video frames are handed to GTK as textures on a GtkPicture wrapped in
+ * a GtkGraphicsOffload, so a Wayland compositor can promote them to a subsurface
+ * (its own hardware plane) rather than the shell Cairo-compositing each frame
+ * into the page. This is the concrete test of GTK 4's graphics-offload API; see
+ * docs/graphics-offload-experiment.md.                                          */
+
+/* TRUE unless this NsProcView is using the Cairo compositing path. Safe to call
+   with the widget torn down (fields are NULLed in on_area_destroy). */
+static inline gboolean
+pv_offload_active(NsProcView *v)
+{
+#ifdef NS_HAVE_GRAPHICS_OFFLOAD
+    return v->vid_offload != NULL;
+#else
+    (void)v;
+    return FALSE;
+#endif
+}
+
+#ifdef NS_HAVE_GRAPHICS_OFFLOAD
+/* Offload is compiled in; a build can still fall back to Cairo at runtime with
+   NS_GRAPHICS_OFFLOAD=0 (handy for A/B measurement without recompiling). */
+static gboolean
+ns_graphics_offload_enabled(void)
+{
+    const char *e = g_getenv("NS_GRAPHICS_OFFLOAD");
+    return !(e && e[0] == '0' && e[1] == '\0');
+}
+
+/* Push the latest video-ring frame onto the offloaded GtkPicture and place it
+   over the <video> rectangle, or hide the subsurface when nothing is playing.
+   No-op unless the offload widgets exist (offload build + widget still alive). */
+static void
+pv_offload_update(NsProcView *v)
+{
+    if (!v->vid_offload || !v->vid_picture)
+        return;
+    if (!(v->vring && v->vid_rect_valid && v->vid_playing)) {
+        gtk_picture_set_paintable(GTK_PICTURE(v->vid_picture), NULL);
+        gtk_widget_set_visible(v->vid_offload, FALSE);
+        return;
+    }
+
+    ns_vring_hdr *r = v->vring;
+    guint32 magic   = r->magic;
+    guint32 slot    = r->latest;
+    guint32 nslots  = r->nslots;
+    guint32 fw      = r->width;
+    guint32 fh      = r->height;
+    guint32 fstride = r->stride;
+    guint32 fbytes  = r->frame_bytes;
+    if (!(magic == NS_VRING_MAGIC && slot != G_MAXUINT32 && slot < nslots &&
+          fw > 0 && fh > 0 &&
+          (guint64)fstride >= (guint64)fw * 4 &&
+          (guint64)fstride * fh <= fbytes &&
+          sizeof(ns_vring_hdr) + (gsize)(slot + 1) * fbytes <= v->vring_bytes))
+        return;
+
+    const unsigned char *px = (const unsigned char *)r + sizeof(ns_vring_hdr) +
+                              (gsize)slot * fbytes;
+    /* Copy the slot out (the video helper may recycle it) and wrap it as a
+       texture. The ring frames are packed like cairo's RGB24: native-endian
+       0x00RRGGBB, i.e. B,G,R,x bytes on little-endian hosts. */
+    GBytes *bytes = g_bytes_new(px, (gsize)fstride * fh);
+    GdkTexture *tex = gdk_memory_texture_new((int)fw, (int)fh,
+                                             GDK_MEMORY_B8G8R8X8, bytes,
+                                             (gsize)fstride);
+    g_bytes_unref(bytes);
+    gtk_picture_set_paintable(GTK_PICTURE(v->vid_picture), GDK_PAINTABLE(tex));
+    g_object_unref(tex);
+
+    gtk_widget_set_size_request(v->vid_picture, (int)v->vid_w, (int)v->vid_h);
+    gtk_widget_set_margin_start(v->vid_offload, (int)v->vid_x);
+    gtk_widget_set_margin_top(v->vid_offload, (int)v->vid_y);
+    gtk_widget_set_visible(v->vid_offload, TRUE);
+
+    if (g_getenv("NS_DBG_COMPOSITE")) {
+        static gint64 last_us;
+        static int frames;
+        frames++;
+        gint64 nowu = g_get_monotonic_time();
+        if (nowu - last_us > 1000000) {
+            last_us = nowu;
+            g_printerr("[offload] presented=%d/s %ux%u rect=%.0f,%.0f "
+                       "%.0fx%.0f (GtkGraphicsOffload)\n",
+                       frames, fw, fh, v->vid_x, v->vid_y, v->vid_w, v->vid_h);
+            frames = 0;
+        }
+    }
+}
+#endif /* NS_HAVE_GRAPHICS_OFFLOAD */
+
 static char *
 ns_proc_video_helper_path(void)
 {
@@ -795,7 +898,12 @@ pv_video_tick(GtkWidget *widget, GdkFrameClock *clock, gpointer data)
         v->vid_tick_id = 0;
         return G_SOURCE_REMOVE;
     }
-    gtk_widget_queue_draw(widget);
+#ifdef NS_HAVE_GRAPHICS_OFFLOAD
+    if (v->vid_offload)
+        pv_offload_update(v);
+    else
+#endif
+        gtk_widget_queue_draw(widget);
     if (++v->vid_tick_count % 60 == 0)
         request_render(v);
     if (v->vid_tick_count % 60 == 0 && v->audio_in) {
@@ -874,8 +982,12 @@ pv_video_handle_line(NsProcView *v, const char *line)
         pv_video_ensure_tick(v);
 #endif
     } else if (n >= 2 && strcmp(tok[0], "closed") == 0) {
-        if (strcmp(tok[1], v->vid_token) == 0)
+        if (strcmp(tok[1], v->vid_token) == 0) {
             pv_vring_unmap(v);
+#ifdef NS_HAVE_GRAPHICS_OFFLOAD
+            pv_offload_update(v);   /* vring gone -> hide the subsurface */
+#endif
+        }
     } else if (n >= 2 && strcmp(tok[0], "playing") == 0) {
         if (strcmp(tok[1], v->vid_token) == 0) {
             v->vid_playing = TRUE;
@@ -885,7 +997,12 @@ pv_video_handle_line(NsProcView *v, const char *line)
                           strcmp(tok[0], "ended") == 0)) {
         if (strcmp(tok[1], v->vid_token) == 0) {
             v->vid_playing = FALSE;
-            gtk_widget_queue_draw(v->area);
+#ifdef NS_HAVE_GRAPHICS_OFFLOAD
+            if (v->vid_offload)
+                pv_offload_update(v);   /* hide the subsurface */
+            else
+#endif
+                gtk_widget_queue_draw(v->area);
         }
     }
     g_strfreev(tok);
@@ -2566,7 +2683,7 @@ on_draw(GtkDrawingArea *area, cairo_t *cr, int width, int height,
         cairo_rectangle(cr, 0, 0, width, height);
         cairo_fill(cr);
     }
-    if (v->vring && v->vid_rect_valid) {
+    if (v->vring && v->vid_rect_valid && !pv_offload_active(v)) {
         gboolean frame_drawn = FALSE;
         ns_vring_hdr *r = v->vring;
         guint32 magic   = r->magic;
@@ -3266,6 +3383,12 @@ on_area_destroy(GtkWidget *widget, gpointer data)
         v->ctx_popover = NULL;
     }
     v->area = NULL;
+#ifdef NS_HAVE_GRAPHICS_OFFLOAD
+    /* Destroyed with the widget tree; drop our references so the video path
+       (pv_offload_update) treats this view as torn down and never touches them. */
+    v->vid_offload = NULL;
+    v->vid_picture = NULL;
+#endif
     v->perm_revealer = NULL;
     v->perm_label = NULL;
     Req *req = g_new0(Req, 1);
@@ -3726,6 +3849,29 @@ ns_proc_view_new(void)
     v->overlay = gtk_overlay_new();
     gtk_overlay_set_child(GTK_OVERLAY(v->overlay), grid);
     gtk_widget_set_vexpand(v->overlay, TRUE);
+
+#ifdef NS_HAVE_GRAPHICS_OFFLOAD
+    /* EXPERIMENTAL video graphics-offload surface. A GtkPicture wrapped in a
+       GtkGraphicsOffload, laid over the page at the <video> rectangle via
+       start-aligned margins. can-target=FALSE so pointer events still fall
+       through to the drawing area (clicks on the video reach the page). */
+    if (ns_graphics_offload_enabled()) {
+        v->vid_picture = gtk_picture_new();
+        gtk_picture_set_content_fit(GTK_PICTURE(v->vid_picture),
+                                    GTK_CONTENT_FIT_FILL);
+        gtk_widget_set_can_target(v->vid_picture, FALSE);
+
+        v->vid_offload = gtk_graphics_offload_new(v->vid_picture);
+        gtk_graphics_offload_set_enabled(GTK_GRAPHICS_OFFLOAD(v->vid_offload),
+                                         GTK_GRAPHICS_OFFLOAD_ENABLED);
+        gtk_widget_set_halign(v->vid_offload, GTK_ALIGN_START);
+        gtk_widget_set_valign(v->vid_offload, GTK_ALIGN_START);
+        gtk_widget_set_can_target(v->vid_offload, FALSE);
+        gtk_widget_set_visible(v->vid_offload, FALSE);
+        gtk_overlay_add_overlay(GTK_OVERLAY(v->overlay), v->vid_offload);
+    }
+#endif
+
     build_perm_bar(v);
     v->root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
     gtk_box_append(GTK_BOX(v->root), v->perm_revealer);

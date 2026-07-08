@@ -147,6 +147,7 @@ else
 endif
 
 have_gtk = false
+have_graphics_offload = false
 if not is_mobile and gtk_feature.allowed()
   gtk4_min = host_machine.system() == 'windows' ? '>=4.22.1' : '>=4.14'
   gtk4 = dependency('gtk4', version: gtk4_min, required: gtk_feature)
@@ -159,6 +160,19 @@ if not is_mobile and gtk_feature.allowed()
       message('GTK @0@ — preferred (>= 4.22).'.format(gtk4.version()))
     else
       warning('GTK @0@ meets the 4.14 minimum, but Nordstjernen prefers >= 4.22 for the newer GSK renderers.'.format(gtk4.version()))
+    endif
+
+    # EXPERIMENTAL: GtkGraphicsOffload path for the <video> overlay. Needs
+    # GtkGraphicsOffload, added in GTK 4.14 (which is already the minimum), so
+    # any GTK that satisfies the shell also satisfies this.
+    offload_feature = get_option('graphics_offload')
+    if offload_feature.allowed()
+      if gtk4.version().version_compare('>=4.14')
+        have_graphics_offload = true
+        message('GTK graphics-offload experiment enabled (GtkGraphicsOffload, GTK @0@).'.format(gtk4.version()))
+      elif offload_feature.enabled()
+        error('graphics_offload requires GTK >= 4.14 (found @0@).'.format(gtk4.version()))
+      endif
     endif
   endif
 endif
@@ -513,5 +527,6 @@ endif
 summary({'WebAssembly (WAMR)': have_wasm}, section: 'Features')
 summary({'AI chat': have_ai, 'AI GPU backend': ai_gpu_backend}, section: 'Features')
 summary({'GTK 4 shell': have_gtk}, section: 'Shells')
+summary({'Graphics offload (video, experimental)': have_graphics_offload}, section: 'Shells')
 
 subdir('src')
