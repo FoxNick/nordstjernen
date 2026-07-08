@@ -146,6 +146,17 @@ else
   have_egl   = cc.has_header('epoxy/egl.h', dependencies: epoxy)
 endif
 
+# Cairo 1.18 exposed the pixman dithering filter to patterns; use it to hide
+# 8-bit banding on smooth CSS/<canvas> gradients (src/cairo_compat.h). Purely a
+# quality win, so just enable it whenever the Cairo we build against is new
+# enough — no user-facing option.
+if cairo.version().version_compare('>=1.18')
+  add_project_arguments('-DNS_HAVE_CAIRO_DITHER=1', language: 'c')
+  message('Cairo @0@ — gradient dithering enabled.'.format(cairo.version()))
+else
+  message('Cairo @0@ — no gradient dithering (needs >= 1.18).'.format(cairo.version()))
+endif
+
 have_gtk = false
 if not is_mobile and gtk_feature.allowed()
   gtk4_min = host_machine.system() == 'windows' ? '>=4.22.1' : '>=4.14'

@@ -13,6 +13,7 @@ static int g_dbg_paint_x = -2, g_dbg_paint_y = -2;
 #include <string.h>
 
 #include "anim.h"
+#include "cairo_compat.h"
 #include "css.h"
 #include "dom.h"
 #include "spellcheck.h"
@@ -622,6 +623,7 @@ paint_bg_gradient_core(cairo_t *cr, const ns_css_gradient *gr,
         rounded_rect_path(cr, clip_x, clip_y, clip_w, clip_h, radii);
         cairo_clip(cr);
         cairo_pattern_t *mesh = cairo_pattern_create_mesh();
+        ns_cairo_gradient_dither(mesh);
         for (int i = 0; i + 1 < nb; i++) {
             double f1 = bnd[i], f2 = bnd[i + 1];
             double span = f2 - f1;
@@ -693,6 +695,7 @@ paint_bg_gradient_core(cairo_t *cr, const ns_css_gradient *gr,
                 x0, y0,
                 x0 + (x1 - x0) * period, y0 + (y1 - y0) * period);
         }
+        ns_cairo_gradient_dither(pat);
         for (int i = 0; i < gr->n_stops; i++) {
             const ns_css_gradient_stop *st = &gr->stops[i];
             cairo_pattern_add_color_stop_rgba(pat, frac[i] / period,
@@ -4614,6 +4617,7 @@ mask_gradient_pattern(const ns_css_gradient *gr,
         pat = cairo_pattern_create_linear(x0, y0,
             x0 + 2.0 * dxh * period, y0 + 2.0 * dyh * period);
     }
+    ns_cairo_gradient_dither(pat);
     for (int i = 0; i < gr->n_stops; i++) {
         const ns_css_gradient_stop *st = &gr->stops[i];
         cairo_pattern_add_color_stop_rgba(pat, frac[i] / period,

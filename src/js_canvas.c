@@ -10,6 +10,7 @@
 #include <gio/gio.h>
 #include <pango/pangocairo.h>
 
+#include "cairo_compat.h"
 #include "css.h"
 #include "net.h"
 #include "video.h"
@@ -805,6 +806,7 @@ ns_ctx_build_conic_pattern(JSContext *ctx, JSValueConst obj)
     const ns_conic_stop *cs = &g_array_index(sa, ns_conic_stop, 0);
 
     cairo_pattern_t *pat = cairo_pattern_create_mesh();
+    ns_cairo_gradient_dither(pat);
     const int sectors = 256;
     const double radius = 1e5;
     for (int i = 0; i < sectors; i++) {
@@ -848,6 +850,7 @@ ns_ctx_build_pattern(JSContext *ctx, JSValueConst obj)
         v = JS_GetPropertyStr(ctx, obj, "_x1"); JS_ToFloat64(ctx, &x1, v); JS_FreeValue(ctx, v);
         v = JS_GetPropertyStr(ctx, obj, "_y1"); JS_ToFloat64(ctx, &y1, v); JS_FreeValue(ctx, v);
         pat = cairo_pattern_create_linear(x0, y0, x1, y1);
+        ns_cairo_gradient_dither(pat);
     } else if (strcmp(type, "pattern") == 0) {
         JS_FreeCString(ctx, type);
         JSValue node_v = JS_GetPropertyStr(ctx, obj, "_node");
@@ -900,6 +903,7 @@ ns_ctx_build_pattern(JSContext *ctx, JSValueConst obj)
         v = JS_GetPropertyStr(ctx, obj, "_y1"); JS_ToFloat64(ctx, &y1, v); JS_FreeValue(ctx, v);
         v = JS_GetPropertyStr(ctx, obj, "_r1"); JS_ToFloat64(ctx, &r1, v); JS_FreeValue(ctx, v);
         pat = cairo_pattern_create_radial(x0, y0, r0, x1, y1, r1);
+        ns_cairo_gradient_dither(pat);
     } else if (strcmp(type, "conic") == 0) {
         JS_FreeCString(ctx, type);
         return ns_ctx_build_conic_pattern(ctx, obj);
